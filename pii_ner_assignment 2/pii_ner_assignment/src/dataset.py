@@ -1,16 +1,33 @@
 import json
 from typing import List, Dict, Any
+
+import torch
 from torch.utils.data import Dataset
+
+from labels import LABELS, LABEL2ID
 
 
 class PIIDataset(Dataset):
-    def __init__(self, path: str, tokenizer, label_list: List[str], max_length: int = 256, is_train: bool = True):
-        self.items = []
+    """
+    JSONL -> tokenized inputs with BIO labels, using character offsets.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        tokenizer,
+        max_length: int = 256,
+        is_train: bool = True,
+    ):
         self.tokenizer = tokenizer
-        self.label_list = label_list
-        self.label2id = {l: i for i, l in enumerate(label_list)}
         self.max_length = max_length
         self.is_train = is_train
+
+        self.label_list = LABELS
+        self.label2id = LABEL2ID
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+        self.examples: List[Dict[str, Any]] = []
 
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -18,82 +35,114 @@ class PIIDataset(Dataset):
                 if not line:
                     continue
                 obj = json.loads(line)
-                text = obj["text"]
-                entities = obj.get("entities", [])
-
-                char_tags = ["O"] * len(text)
-                for e in entities:
-                    s, e_idx, lab = e["start"], e["end"], e["label"]
-                    if s < 0 or e_idx > len(text) or s >= e_idx:
-                        continue
-                    char_tags[s] = f"B-{lab}"
-                    for i in range(s + 1, e_idx):
-                        char_tags[i] = f"I-{lab}"
-
-                enc = tokenizer(
-                    text,
-                    return_offsets_mapping=True,
-                    truncation=True,
-                    max_length=self.max_length,
-                    add_special_tokens=True,
-                )
-                offsets = enc["offset_mapping"]
-                input_ids = enc["input_ids"]
-                attention_mask = enc["attention_mask"]
-
-                bio_tags = []
-                for (start, end) in offsets:
-                    if start == end:
-                        bio_tags.append("O")
-                    else:
-                        if start < len(char_tags):
-                            bio_tags.append(char_tags[start])
-                        else:
-                            bio_tags.append("O")
-
-                if len(bio_tags) != len(input_ids):
-                    bio_tags = ["O"] * len(input_ids)
-
-                label_ids = [self.label2id.get(t, self.label2id["O"]) for t in bio_tags]
-
-                self.items.append(
-                    {
-                        "id": obj["id"],
-                        "text": text,
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "labels": label_ids,
-                        "offset_mapping": offsets,
-                    }
-                )
+                ex = {
+                    "id": obj["id"],
+                    "text": obj["text"],
+                    # may be missing for test.jsonl
+                    "entities": obj.get("entities", []),
+                }
+                self.examples.append(ex)
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.examples)
+
+    def _encode_labels(self, offsets, entities: List[Dict[str, Any]]) -> List[int]:
+        """
+        Convert character-level entity spans to BIO labels per token.
+        offsets: list of (start, end) pairs from tokenizer
+        entities: list of {"start": int, "end": int, "label": str}
+        """
+        labels: List[int] = []
+
+        for start, end in offsets:
+            # Special tokens have (0,0) offsets in HF fast tokenizers
+            if start == 0 and end == 0:
+                labels.append(-100)
+                continue
+
+            tag = "O"
+
+            for ent in entities:
+                ent_start = ent["start"]
+                ent_end = ent["end"]
+
+                # No overlap
+                if end <= ent_start or start >= ent_end:
+                    continue
+
+                ent_label = ent["label"]
+                if start == ent_start:
+                    tag = f"B-{ent_label}"
+                else:
+                    tag = f"I-{ent_label}"
+                break  # assume no overlapping entities
+
+            labels.append(self.label2id.get(tag, self.label2id["O"]))
+
+        return labels
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return self.items[idx]
+        ex = self.examples[idx]
+        text = ex["text"]
+
+        encoding = self.tokenizer(
+            text,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=self.max_length,
+        )
+
+        offsets = encoding["offset_mapping"]
+
+        if self.is_train and ex.get("entities") is not None:
+            labels = self._encode_labels(offsets, ex["entities"])
+        else:
+            # For test or unlabeled data
+            labels = [-100] * len(offsets)
+
+        return {
+            "id": ex["id"],
+            "text": text,
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+            "offset_mapping": offsets,
+            "labels": labels,
+            "pad_token_id": self.pad_token_id,
+        }
 
 
-def collate_batch(batch, pad_token_id: int, label_pad_id: int = -100):
-    input_ids_list = [x["input_ids"] for x in batch]
-    attention_list = [x["attention_mask"] for x in batch]
-    labels_list = [x["labels"] for x in batch]
+def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pads a batch of variable-length sequences to tensors.
+    Keeps ids/texts/offset_mapping around for possible analysis.
+    """
+    max_len = max(len(x["input_ids"]) for x in batch)
 
-    max_len = max(len(ids) for ids in input_ids_list)
-
-    def pad(seq, pad_value, max_len):
+    def pad(seq, pad_value):
         return seq + [pad_value] * (max_len - len(seq))
 
-    input_ids = [pad(ids, pad_token_id, max_len) for ids in input_ids_list]
-    attention_mask = [pad(am, 0, max_len) for am in attention_list]
-    labels = [pad(lab, label_pad_id, max_len) for lab in labels_list]
+    pad_token_id = batch[0].get("pad_token_id", 0)
+    label_pad_id = -100
 
-    out = {
+    input_ids = torch.tensor(
+        [pad(x["input_ids"], pad_token_id) for x in batch], dtype=torch.long
+    )
+    attention_mask = torch.tensor(
+        [pad(x["attention_mask"], 0) for x in batch], dtype=torch.long
+    )
+    labels = torch.tensor(
+        [pad(x["labels"], label_pad_id) for x in batch], dtype=torch.long
+    )
+
+    # offset_mapping is kept as list-of-lists (not used in training loss)
+    offset_mapping = [pad(x["offset_mapping"], (0, 0)) for x in batch]
+
+    out: Dict[str, Any] = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "ids": [x["id"] for x in batch],
         "texts": [x["text"] for x in batch],
-        "offset_mapping": [x["offset_mapping"] for x in batch],
+        "offset_mapping": offset_mapping,
     }
     return out
